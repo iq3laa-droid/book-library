@@ -1,0 +1,1676 @@
+package com.example.booklibrary
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.pdf.PdfRenderer
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.provider.Settings
+import android.util.LruCache
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.StringWriter
+import java.util.UUID
+import kotlin.random.Random
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        PDFBoxResourceLoader.init(applicationContext)
+        setContent { BookLibraryApp() }
+    }
+}
+
+data class Book(
+    val id: String,
+    val path: String,
+    val title: String,
+    val page: Int,
+    val total: Int,
+    val addedAt: Long,
+    val coverPath: String? = null,
+    val lastRead: Long = 0L,
+    val favorite: Boolean = false
+)
+
+data class Quote(
+    val id: String,
+    val bookTitle: String,
+    val text: String,
+    val imagePath: String?,
+    val page: Int,
+    val createdAt: Long
+)
+
+class LibraryStore(context: Context) {
+    private val prefs = context.getSharedPreferences("book_library", Context.MODE_PRIVATE)
+
+    fun loadBooks(): List<Book> {
+        val arr = JSONArray(prefs.getString("books", "[]") ?: "[]")
+        return (0 until arr.length()).mapNotNull { i ->
+            runCatching {
+                val o = arr.getJSONObject(i)
+                Book(
+                    o.getString("id"), o.getString("path"), o.getString("title"),
+                    o.optInt("page", 0), o.optInt("total", 1), o.optLong("addedAt", 0L),
+                    o.optString("coverPath", "").ifBlank { null },
+                    o.optLong("lastRead", 0L),
+                    o.optBoolean("favorite", false)
+                )
+            }.getOrNull()
+        }
+    }
+
+    fun saveBooks(books: List<Book>) {
+        val arr = JSONArray()
+        books.forEach { b ->
+            arr.put(JSONObject().apply {
+                put("id", b.id); put("path", b.path); put("title", b.title)
+                put("page", b.page); put("total", b.total); put("addedAt", b.addedAt)
+                put("coverPath", b.coverPath ?: ""); put("lastRead", b.lastRead)
+                put("favorite", b.favorite)
+            })
+        }
+        prefs.edit().putString("books", arr.toString()).apply()
+    }
+
+    fun loadQuotes(): List<Quote> {
+        val arr = JSONArray(prefs.getString("quotes", "[]") ?: "[]")
+        return (0 until arr.length()).mapNotNull { i ->
+            runCatching {
+                val o = arr.getJSONObject(i)
+                Quote(
+                    o.getString("id"), o.getString("bookTitle"), o.getString("text"),
+                    o.optString("imagePath", "").ifBlank { null },
+                    o.optInt("page", 0), o.optLong("createdAt", 0L)
+                )
+            }.getOrNull()
+        }
+    }
+
+    fun saveQuotes(quotes: List<Quote>) {
+        val arr = JSONArray()
+        quotes.forEach { q ->
+            arr.put(JSONObject().apply {
+                put("id", q.id); put("bookTitle", q.bookTitle); put("text", q.text)
+                put("imagePath", q.imagePath ?: ""); put("page", q.page); put("createdAt", q.createdAt)
+            })
+        }
+        prefs.edit().putString("quotes", arr.toString()).apply()
+    }
+}
+
+// ===================== حالة القراءة العامة =====================
+var lastKnownPage = 0
+var currentReadingBookId: String? = null
+
+// ===================== PDF Cache + Session =====================
+
+object PdfBitmapCache {
+    private val cache = object : LruCache<String, Bitmap>(48 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap) = value.byteCount
+    }
+    fun get(key: String): Bitmap? = cache.get(key)
+    fun put(key: String, bmp: Bitmap) { cache.put(key, bmp) }
+    fun clear() = cache.evictAll()
+}
+
+class PdfSession(private val path: String) {
+    private var pfd: ParcelFileDescriptor? = null
+    private var renderer: PdfRenderer? = null
+
+    init {
+        try {
+            pfd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd!!)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    fun pageCount(): Int = renderer?.pageCount ?: 0
+
+    @Synchronized
+    fun render(pageIndex: Int, targetWidth: Int): Bitmap? {
+        val cacheKey = "$path#$pageIndex#$targetWidth"
+        PdfBitmapCache.get(cacheKey)?.let { return it }
+
+        val r = renderer ?: return null
+        if (pageIndex !in 0 until r.pageCount) return null
+        return try {
+            r.openPage(pageIndex).use { page ->
+                val height = (targetWidth * page.height.toFloat() / page.width).toInt().coerceAtLeast(1)
+                val bitmap = Bitmap.createBitmap(targetWidth, height, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(android.graphics.Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                PdfBitmapCache.put(cacheKey, bitmap)
+                bitmap
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    fun close() {
+        runCatching { renderer?.close() }
+        runCatching { pfd?.close() }
+        renderer = null
+        pfd = null
+    }
+}
+
+// ===================== بحث في PDF مع مواضع الكلمات =====================
+
+data class WordHit(val page: Int, val rect: RectF)
+
+/**
+ * يبحث عن الكلمة في كل صفحات الـ PDF ويعيد:
+ * - قائمة الصفحات التي تحتويها
+ * - إحداثيات الكلمة داخل كل صفحة (كنسبة 0..1) لتلوينها لاحقاً
+ */
+suspend fun searchPdfWithPositions(
+    filePath: String,
+    query: String,
+    onProgress: (Float) -> Unit = {}
+): Pair<List<Int>, Map<Int, List<RectF>>> {
+    val pages = mutableListOf<Int>()
+    val positions = mutableMapOf<Int, MutableList<RectF>>()
+    var document: PDDocument? = null
+    try {
+        val file = File(filePath)
+        document = PDDocument.load(
+            file,
+            com.tom_roush.pdfbox.io.MemoryUsageSetting.setupTempFileOnly()
+        )
+        val total = document.numberOfPages
+        val q = query.lowercase()
+
+        val stripper = object : PDFTextStripper() {
+            override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
+                if (text == null || textPositions.isNullOrEmpty()) return
+                val pageIdx = startPage - 1
+                // نعالج كل موضع حرف ونكوّن كلمات
+                var i = 0
+                while (i < textPositions.size) {
+                    // اجمع أحرفاً متتالية بدون مسافة لتكوين كلمة
+                    val wordChars = mutableListOf<TextPosition>()
+                    while (i < textPositions.size && !textPositions[i].unicode.trim().isEmpty()) {
+                        wordChars.add(textPositions[i])
+                        i++
+                    }
+                    if (wordChars.isNotEmpty()) {
+                        val word = wordChars.joinToString("") { it.unicode }
+                        if (word.lowercase().contains(q)) {
+                            if (!pages.contains(pageIdx)) pages.add(pageIdx)
+                            // احسب rect الكلمة كله
+                            val minX = wordChars.minOf { it.xDirAdj }
+                            val maxX = wordChars.maxOf { it.xDirAdj + it.widthDirAdj }
+                            val minY = wordChars.minOf { it.yDirAdj - it.heightDir }
+                            val maxY = wordChars.maxOf { it.yDirAdj }
+                            // حوّل للإحداثيات النسبية باستخدام أبعاد الصفحة
+                            val page1 = document?.getPage(pageIdx)
+                            if (page1 != null) {
+                                val pw = page1.mediaBox.width
+                                val ph = page1.mediaBox.height
+                                val rect = RectF(minX / pw, minY / ph, maxX / pw, maxY / ph)
+                                positions.getOrPut(pageIdx) { mutableListOf() }.add(rect)
+                            }
+                        }
+                    }
+                    i++
+                }
+            }
+        }
+        stripper.sortByPosition = true
+
+        for (i in 0 until total) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            stripper.startPage = i + 1
+            stripper.endPage = i + 1
+            stripper.getText(document)
+            onProgress((i + 1).toFloat() / total)
+        }
+        document.close()
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        runCatching { document?.close() }
+        throw e
+    } catch (e: Exception) {
+        e.printStackTrace()
+        runCatching { document?.close() }
+    }
+    return pages to positions
+}
+
+/**
+ * يرسم مستطيلات صفراء فوق صورة الصفحة عند مواضع الكلمة.
+ * positions نسبية (0..1) نسبة لأبعاد الصفحة.
+ */
+fun drawHighlightsOnBitmap(
+    base: Bitmap,
+    positions: List<RectF>
+): Bitmap {
+    if (positions.isEmpty()) return base
+    val mutable = base.copy(Bitmap.Config.ARGB_8888, true)
+    val canvas = Canvas(mutable)
+    val paint = Paint().apply {
+        color = AndroidColor.argb(140, 255, 235, 59) // أصفر شفاف
+        style = Paint.Style.FILL
+    }
+    val w = mutable.width.toFloat()
+    val h = mutable.height.toFloat()
+    for (r in positions) {
+        // ملاحظة: إحداثيات PDF تكون من الأعلى حسب yDirAdj لـ PDFBox
+        val rect = RectF(r.left * w, r.top * h, r.right * w, r.bottom * h)
+        canvas.drawRect(rect, paint)
+    }
+    return mutable
+}
+
+// ===================== شاشة التطبيق الرئيسية =====================
+
+@Composable
+fun BookLibraryApp() {
+    val context = LocalContext.current
+    val store = remember { LibraryStore(context) }
+    var books by remember { mutableStateOf(store.loadBooks()) }
+    var quotes by remember { mutableStateOf(store.loadQuotes()) }
+    var readingBook by remember { mutableStateOf<Book?>(null) }
+    var showQuotes by remember { mutableStateOf(false) }
+    var dark by remember { mutableStateOf(false) }
+    // البحث الممرر لشاشة القارئ (نص + مواضع)
+    var readerSearchQuery by remember { mutableStateOf("") }
+    var readerSearchPositions by remember { mutableStateOf<Map<Int, List<RectF>>>(emptyMap()) }
+
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                if (currentReadingBookId != null) {
+                    val updatedBooks = books.map {
+                        if (it.id == currentReadingBookId)
+                            it.copy(page = lastKnownPage, lastRead = System.currentTimeMillis())
+                        else it
+                    }
+                    store.saveBooks(updatedBooks)
+                    books = updatedBooks
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    BackHandler(enabled = readingBook != null || showQuotes) {
+        if (readingBook != null) {
+            (context as Activity).requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            if (currentReadingBookId != null) {
+                val updatedBooks = books.map {
+                    if (it.id == currentReadingBookId)
+                        it.copy(page = lastKnownPage, lastRead = System.currentTimeMillis())
+                    else it
+                }
+                store.saveBooks(updatedBooks)
+                books = updatedBooks
+            }
+            currentReadingBookId = null
+            readingBook = null
+            readerSearchQuery = ""
+            readerSearchPositions = emptyMap()
+        } else if (showQuotes) {
+            showQuotes = false
+        }
+    }
+
+    MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            when {
+                readingBook != null -> {
+                    currentReadingBookId = readingBook!!.id
+                    lastKnownPage = readingBook!!.page
+                    ReaderScreen(
+                        book = readingBook!!,
+                        initialSearchQuery = readerSearchQuery,
+                        initialSearchPositions = readerSearchPositions,
+                        onProgress = { page ->
+                            lastKnownPage = page
+                            readingBook = readingBook?.copy(page = page, lastRead = System.currentTimeMillis())
+                        },
+                        onBack = { page ->
+                            (context as Activity).requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            if (currentReadingBookId != null) {
+                                val updatedBooks = books.map {
+                                    if (it.id == currentReadingBookId)
+                                        it.copy(page = page, lastRead = System.currentTimeMillis())
+                                    else it
+                                }
+                                store.saveBooks(updatedBooks)
+                                books = updatedBooks
+                            }
+                            currentReadingBookId = null
+                            readingBook = null
+                            readerSearchQuery = ""
+                            readerSearchPositions = emptyMap()
+                        },
+                        onAddQuote = { quote ->
+                            quotes = quotes + quote
+                            store.saveQuotes(quotes)
+                        }
+                    )
+                }
+
+                showQuotes -> QuotesScreen(
+                    quotes = quotes,
+                    onDelete = { id ->
+                        quotes = quotes.filter { it.id != id }
+                        store.saveQuotes(quotes)
+                    },
+                    onBack = { showQuotes = false }
+                )
+
+                else -> LibraryScreen(
+                    books = books,
+                    dark = dark,
+                    onToggleDark = { dark = !dark },
+                    onOpenQuotes = { showQuotes = true },
+                    onOpenBook = { readingBook = it },
+                    onImport = { newBooks ->
+                        books = books + newBooks
+                        store.saveBooks(books)
+                    },
+                    onDelete = { id ->
+                        books.find { it.id == id }?.coverPath?.let { runCatching { File(it).delete() } }
+                        books = books.filter { it.id != id }
+                        store.saveBooks(books)
+                    },
+                    onToggleFavorite = { id ->
+                        books = books.map { if (it.id == id) it.copy(favorite = !it.favorite) else it }
+                        store.saveBooks(books)
+                    }
+                )
+            }
+        }
+    }
+}
+
+// ===================== المكتبة =====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LibraryScreen(
+    books: List<Book>,
+    dark: Boolean,
+    onToggleDark: () -> Unit,
+    onOpenQuotes: () -> Unit,
+    onOpenBook: (Book) -> Unit,
+    onImport: (List<Book>) -> Unit,
+    onDelete: (String) -> Unit,
+    onToggleFavorite: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var bookToDelete by remember { mutableStateOf<Book?>(null) }
+    var isScanning by remember { mutableStateOf(false) }
+    var scanProgress by remember { mutableFloatStateOf(0f) }
+    var showOnlyRecent by remember { mutableStateOf(false) }
+    var showOnlyFavorites by remember { mutableStateOf(false) }
+    var columnsCount by remember { mutableStateOf(3) }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+
+    // حالة البحث في المكتبة
+    var librarySearchOpen by remember { mutableStateOf(false) }
+    var librarySearchQuery by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        if (books.isEmpty()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (!Environment.isExternalStorageManager()) {
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                        intent.addCategory("android.intent.category.DEFAULT")
+                        intent.data = Uri.parse("package:${context.packageName}")
+                        context.startActivity(intent)
+                    } catch (e: Exception) {
+                        val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                        context.startActivity(intent)
+                    }
+                } else {
+                    performScanWithProgress(context, scope, books, onImport, { isScanning = it }, { scanProgress = it })
+                }
+            } else {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
+                    performScanWithProgress(context, scope, books, onImport, { isScanning = it }, { scanProgress = it })
+                }
+            }
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val book = withContext(Dispatchers.IO) { importPdf(context, uri) }
+                if (book != null) onImport(listOf(book))
+            }
+        }
+    }
+
+    // ترتيب + فلترة
+    val baseBooks = when {
+        showOnlyRecent -> books.filter { it.lastRead > 0 }.sortedByDescending { it.lastRead }
+        showOnlyFavorites -> books.filter { it.favorite }.sortedBy { it.title }
+        else -> books.sortedBy { it.title }
+    }
+    val displayedBooks = if (librarySearchQuery.isBlank()) baseBooks
+    else baseBooks.filter { it.title.contains(librarySearchQuery, ignoreCase = true) }
+
+    val woodBackground = Brush.verticalGradient(
+        colors = listOf(Color(0xFFB58B6A), Color(0xFF8B5A2B), Color(0xFF5C3A21))
+    )
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Text("Book Library", modifier = Modifier.padding(16.dp), fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                Divider()
+                NavigationDrawerItem(
+                    label = { Text("كل الكتب") },
+                    selected = !showOnlyRecent && !showOnlyFavorites,
+                    onClick = {
+                        showOnlyRecent = false; showOnlyFavorites = false
+                        scope.launch { drawerState.close() }
+                    },
+                    icon = { Icon(Icons.Default.List, null) }
+                )
+                NavigationDrawerItem(
+                    label = { Text("القراءة الحالية") },
+                    selected = showOnlyRecent,
+                    onClick = {
+                        showOnlyRecent = true; showOnlyFavorites = false
+                        scope.launch { drawerState.close() }
+                    },
+                    icon = { Icon(Icons.Default.History, null) }
+                )
+                NavigationDrawerItem(
+                    label = { Text("المفضلة") },
+                    selected = showOnlyFavorites,
+                    onClick = {
+                        showOnlyFavorites = true; showOnlyRecent = false
+                        scope.launch { drawerState.close() }
+                    },
+                    icon = { Icon(Icons.Default.Favorite, null) }
+                )
+                NavigationDrawerItem(
+                    label = { Text("مخزن الاقتباسات") },
+                    selected = false,
+                    onClick = { onOpenQuotes(); scope.launch { drawerState.close() } },
+                    icon = { Icon(Icons.Default.FormatQuote, null) }
+                )
+                Divider()
+                Text("حجم الشبكة", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), fontSize = 12.sp, color = Color.Gray)
+                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(2, 3, 4, 5).forEach { cols ->
+                        FilterChip(
+                            selected = columnsCount == cols,
+                            onClick = { columnsCount = cols },
+                            label = { Text("$cols × $cols") }
+                        )
+                    }
+                }
+            }
+        }
+    ) {
+        Scaffold(
+            topBar = {
+                Column {
+                    Surface(shadowElevation = 4.dp, color = Color(0xFF2D1B11)) {
+                        if (librarySearchOpen) {
+                            // شريط البحث
+                            Row(
+                                modifier = Modifier.fillMaxWidth().height(50.dp).padding(horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                IconButton(onClick = {
+                                    librarySearchOpen = false; librarySearchQuery = ""
+                                }) {
+                                    Icon(Icons.Default.ArrowBack, "إغلاق", tint = Color.White)
+                                }
+                                TextField(
+                                    value = librarySearchQuery,
+                                    onValueChange = { librarySearchQuery = it },
+                                    placeholder = { Text("ابحث عن كتاب...", color = Color.White.copy(alpha = 0.6f)) },
+                                    singleLine = true,
+                                    colors = TextFieldDefaults.colors(
+                                        focusedContainerColor = Color.Transparent,
+                                        unfocusedContainerColor = Color.Transparent,
+                                        focusedTextColor = Color.White,
+                                        unfocusedTextColor = Color.White,
+                                        cursorColor = Color.White,
+                                        focusedIndicatorColor = Color.Transparent,
+                                        unfocusedIndicatorColor = Color.Transparent
+                                    ),
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().height(50.dp).padding(horizontal = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                                    Icon(Icons.Default.Menu, "القائمة", tint = Color.White)
+                                }
+                                Text(
+                                    text = when {
+                                        showOnlyRecent -> "القراءة الحالية"
+                                        showOnlyFavorites -> "المفضلة"
+                                        else -> "Book Library"
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp,
+                                    color = Color.White
+                                )
+                                // بحث في المكتبة
+                                IconButton(onClick = { librarySearchOpen = true }) {
+                                    Icon(Icons.Default.Search, "بحث", tint = Color.White)
+                                }
+                                IconButton(onClick = onToggleDark) {
+                                    Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, "وضع", tint = Color.White)
+                                }
+                                IconButton(onClick = { launcher.launch(arrayOf("application/pdf")) }) {
+                                    Icon(Icons.Default.Add, "إضافة ملف", tint = Color.White)
+                                }
+                                IconButton(onClick = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        if (Environment.isExternalStorageManager()) {
+                                            performScanWithProgress(context, scope, books, onImport, { isScanning = it }, { scanProgress = it })
+                                        } else {
+                                            try {
+                                                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                                intent.addCategory("android.intent.category.DEFAULT")
+                                                intent.data = Uri.parse("package:${context.packageName}")
+                                                context.startActivity(intent)
+                                            } catch (e: Exception) {
+                                                val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                                context.startActivity(intent)
+                                            }
+                                        }
+                                    } else {
+                                        performScanWithProgress(context, scope, books, onImport, { isScanning = it }, { scanProgress = it })
+                                    }
+                                }) {
+                                    if (isScanning) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
+                                    else Icon(Icons.Default.Refresh, "فحص الجهاز", tint = Color.White)
+                                }
+                            }
+                        }
+                    }
+
+                    if (isScanning) {
+                        Column(modifier = Modifier.fillMaxWidth().background(Color(0xFF2D1B11)).padding(horizontal = 16.dp, vertical = 4.dp)) {
+                            LinearProgressIndicator(
+                                progress = { scanProgress.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                                color = Color(0xFF9E86FF),
+                                trackColor = Color.DarkGray
+                            )
+                            Text(
+                                text = "جاري الفحص... ${(scanProgress.coerceIn(0f, 1f) * 100).toInt()}%",
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        ) { padding ->
+            Box(
+                modifier = Modifier.padding(padding).fillMaxSize().background(woodBackground)
+            ) {
+                if (displayedBooks.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            when {
+                                librarySearchQuery.isNotBlank() -> "لا نتائج لـ \"$librarySearchQuery\""
+                                showOnlyFavorites -> "لا توجد كتب في المفضلة بعد."
+                                else -> "رفك فارغ. اضغط على + لإضافة كتاب، أو زر التحديث لفحص الجهاز."
+                            },
+                            color = Color.White
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
+                    ) {
+                        items(displayedBooks.chunked(columnsCount)) { rowBooks ->
+                            Column(modifier = Modifier.padding(horizontal = 12.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().height(200.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.Top
+                                ) {
+                                    rowBooks.forEach { book ->
+                                        val rotation = remember(book.id) { Random.nextFloat() * 2f - 1f }
+                                        Column(
+                                            modifier = Modifier.weight(1f).fillMaxHeight()
+                                        ) {
+                                            // الغلاف + زر المفضلة
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .weight(1f)
+                                                    .graphicsLayer(rotationZ = rotation)
+                                                    .pointerInput(book) {
+                                                        detectTapGestures(
+                                                            onTap = { onOpenBook(book) },
+                                                            onLongPress = { bookToDelete = book }
+                                                        )
+                                                    }
+                                            ) {
+                                                Card(
+                                                    modifier = Modifier.fillMaxSize().shadow(8.dp, RoundedCornerShape(4.dp)),
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                                ) {
+                                                    val coverBmp by produceState<Bitmap?>(null, book.coverPath) {
+                                                        value = withContext(Dispatchers.IO) {
+                                                            book.coverPath?.let { path ->
+                                                                val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                                                                BitmapFactory.decodeFile(path, opts)
+                                                            }
+                                                        }
+                                                    }
+                                                    if (coverBmp != null) {
+                                                        Image(
+                                                            bitmap = coverBmp!!.asImageBitmap(),
+                                                            contentDescription = "غلاف",
+                                                            modifier = Modifier.fillMaxSize(),
+                                                            contentScale = ContentScale.Crop
+                                                        )
+                                                    } else {
+                                                        Box(
+                                                            Modifier.fillMaxSize().background(Color(0xFFE0E0E0)),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                book.title,
+                                                                textAlign = TextAlign.Center,
+                                                                modifier = Modifier.padding(4.dp),
+                                                                fontSize = 12.sp
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                // زر المفضلة (قلب) في الأعلى يميناً
+                                                IconButton(
+                                                    onClick = { onToggleFavorite(book.id) },
+                                                    modifier = Modifier
+                                                        .align(Alignment.TopEnd)
+                                                        .size(28.dp)
+                                                        .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(50))
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (book.favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                                        contentDescription = "مفضلة",
+                                                        tint = if (book.favorite) Color(0xFFFF5252) else Color.White,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                            }
+
+                                            // اسم الكتاب + نسبة التقدم
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = book.title,
+                                                fontSize = 11.sp,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                color = Color.White,
+                                                fontWeight = FontWeight.SemiBold,
+                                                textAlign = TextAlign.Center,
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
+                                            val progress = if (book.total > 0)
+                                                ((book.page.toFloat() / book.total.toFloat()) * 100f).coerceIn(0f, 100f)
+                                            else 0f
+                                            Text(
+                                                text = "${progress.toInt()}%",
+                                                fontSize = 10.sp,
+                                                color = if (progress >= 100f) Color(0xFF7CFF7C) else Color.White.copy(alpha = 0.85f),
+                                                textAlign = TextAlign.Center,
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
+                                            // شريط تقدم صغير
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(top = 2.dp)
+                                                    .height(3.dp)
+                                                    .clip(RoundedCornerShape(2.dp))
+                                                    .background(Color.White.copy(alpha = 0.25f))
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth(progress / 100f)
+                                                        .fillMaxHeight()
+                                                        .background(if (progress >= 100f) Color(0xFF7CFF7C) else Color(0xFF9E86FF))
+                                                )
+                                            }
+                                        }
+                                    }
+                                    repeat(columnsCount - rowBooks.size) {
+                                        Spacer(modifier = Modifier.weight(1f))
+                                    }
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(12.dp)
+                                        .background(Brush.verticalGradient(colors = listOf(Color(0xFF6D4C41), Color(0xFF3E2723))))
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(20.dp)
+                                        .background(Brush.verticalGradient(colors = listOf(Color.Black.copy(alpha = 0.4f), Color.Transparent)))
+                                )
+                                Spacer(modifier = Modifier.height(16.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (bookToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { bookToDelete = null },
+            title = { Text("حذف الكتاب") },
+            text = { Text("هل أنت متأكد من حذف '${bookToDelete?.title}'؟") },
+            confirmButton = {
+                TextButton(onClick = { onDelete(bookToDelete!!.id); bookToDelete = null }) {
+                    Text("حذف", color = Color.Red)
+                }
+            },
+            dismissButton = { TextButton(onClick = { bookToDelete = null }) { Text("إلغاء") } }
+        )
+    }
+}
+
+// ===================== أدوات PDF =====================
+
+fun renderPdfPage(path: String, pageIndex: Int, targetWidth: Int = 1080): Bitmap? {
+    val cacheKey = "$path#$pageIndex#$targetWidth"
+    PdfBitmapCache.get(cacheKey)?.let { return it }
+
+    var pfd: ParcelFileDescriptor? = null
+    var renderer: PdfRenderer? = null
+    var page: PdfRenderer.Page? = null
+    return try {
+        pfd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+        renderer = PdfRenderer(pfd)
+        if (pageIndex !in 0 until renderer.pageCount) return null
+        page = renderer.openPage(pageIndex)
+        val width = targetWidth
+        val height = (width * page.height.toFloat() / page.width).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.WHITE)
+        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        PdfBitmapCache.put(cacheKey, bitmap)
+        bitmap
+    } catch (e: Exception) { null } finally {
+        runCatching { page?.close() }
+        runCatching { renderer?.close() }
+        runCatching { pfd?.close() }
+    }
+}
+
+fun performScanWithProgress(
+    context: Context,
+    scope: kotlinx.coroutines.CoroutineScope,
+    books: List<Book>,
+    onImport: (List<Book>) -> Unit,
+    setScanning: (Boolean) -> Unit,
+    updateProgress: (Float) -> Unit
+) {
+    setScanning(true)
+    updateProgress(0f)
+    scope.launch {
+        val foundBooks = withContext(Dispatchers.IO) {
+            scanDeviceForPdfsSimple(context, books, updateProgress)
+        }
+        onImport(foundBooks)
+        setScanning(false)
+        if (foundBooks.isNotEmpty()) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, "تم العثور على ${foundBooks.size} كتاب جديد", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, "لم يتم العثور على ملفات جديدة", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+fun scanDeviceForPdfsSimple(context: Context, existingBooks: List<Book>, updateProgress: (Float) -> Unit): List<Book> {
+    val foundBooks = mutableListOf<Book>()
+    val existingPaths = existingBooks.map { it.path }.toSet()
+
+    val projection = arrayOf(
+        MediaStore.Files.FileColumns.DATA,
+        MediaStore.Files.FileColumns.DISPLAY_NAME
+    )
+    val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?"
+    val selectionArgs = arrayOf(
+        MediaStore.Files.FileColumns.MEDIA_TYPE_NONE.toString(),
+        MediaStore.Files.FileColumns.MEDIA_TYPE_DOCUMENT.toString()
+    )
+
+    context.contentResolver.query(MediaStore.Files.getContentUri("external"), projection, selection, selectionArgs, null)?.use { cursor ->
+        val dataColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA)
+        val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+
+        val totalCount = cursor.count
+        var currentCount = 0
+
+        while (cursor.moveToNext()) {
+            currentCount++
+            if (totalCount > 0) updateProgress(currentCount.toFloat() / totalCount)
+
+            val path = cursor.getString(dataColumn)
+            val name = cursor.getString(nameColumn)
+
+            if (name != null && name.endsWith(".pdf", ignoreCase = true) && path != null && !existingPaths.contains(path)) {
+                val total = getPageCount(path) ?: continue
+
+                val coverFile = File(context.filesDir, "covers/${UUID.randomUUID()}_cover.jpg")
+                coverFile.parentFile?.mkdirs()
+                val coverBmp = renderPdfPage(path, 0, 400)
+                coverBmp?.let { coverFile.outputStream().use { out -> it.compress(Bitmap.CompressFormat.JPEG, 80, out) } }
+
+                foundBooks.add(
+                    Book(
+                        id = UUID.randomUUID().toString(),
+                        path = path,
+                        title = name.removeSuffix(".pdf"),
+                        page = 0,
+                        total = total,
+                        addedAt = System.currentTimeMillis(),
+                        coverPath = coverFile.absolutePath,
+                        lastRead = 0L
+                    )
+                )
+            }
+        }
+    }
+
+    updateProgress(1f)
+    return foundBooks
+}
+
+// ===================== وضع القراءة =====================
+
+enum class ReadingMode(val label: String, val background: Color) {
+    NORMAL("نهاري", Color.White),
+    SEPIA("ورقي", Color(0xFFF4ECD8)),
+    NIGHT("ليلي", Color.Black);
+
+    val filter: ColorFilter?
+        get() = when (this) {
+            NORMAL -> null
+            SEPIA -> ColorFilter.colorMatrix(
+                ColorMatrix(
+                    floatArrayOf(
+                        0.393f, 0.769f, 0.189f, 0f, 0f,
+                        0.349f, 0.686f, 0.168f, 0f, 0f,
+                        0.272f, 0.534f, 0.131f, 0f, 0f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+            )
+            NIGHT -> ColorFilter.colorMatrix(
+                ColorMatrix(
+                    floatArrayOf(
+                        -1f, 0f, 0f, 0f, 255f,
+                        0f, -1f, 0f, 0f, 255f,
+                        0f, 0f, -1f, 0f, 255f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+            )
+        }
+}
+
+// ===================== شاشة القراءة =====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReaderScreen(
+    book: Book,
+    initialSearchQuery: String,
+    initialSearchPositions: Map<Int, List<RectF>>,
+    onProgress: (Int) -> Unit,
+    onBack: (Int) -> Unit,
+    onAddQuote: (Quote) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val activity = context as Activity
+
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    val pdfSession = remember(book.path) { PdfSession(book.path) }
+    DisposableEffect(Unit) {
+        onDispose { pdfSession.close() }
+    }
+
+    val pagerState = rememberPagerState(
+        initialPage = book.page.coerceIn(0, (book.total - 1).coerceAtLeast(0)),
+        pageCount = { book.total }
+    )
+    val lazyListState = rememberLazyListState(
+        initialFirstVisibleItemIndex = book.page.coerceIn(0, (book.total - 1).coerceAtLeast(0))
+    )
+
+    var mode by remember { mutableStateOf(ReadingMode.NORMAL) }
+    var showQuoteDialog by remember { mutableStateOf(false) }
+    var showJumpDialog by remember { mutableStateOf(false) }
+    var showSearchDialog by remember { mutableStateOf(false) }
+    var showBrightnessDialog by remember { mutableStateOf(false) }
+
+    var currentBrightness by remember {
+        val initialBrightness = activity.window.attributes.screenBrightness
+        mutableFloatStateOf(if (initialBrightness < 0f) 0.5f else initialBrightness)
+    }
+
+    var jumpPageText by remember { mutableStateOf("") }
+    var searchQuery by remember { mutableStateOf(initialSearchQuery) }
+    var searchResults by remember { mutableStateOf<List<Int>?>(null) }
+    var isSearching by remember { mutableStateOf(false) }
+    var searchProgress by remember { mutableFloatStateOf(0f) }
+    var searchJob by remember { mutableStateOf<Job?>(null) }
+    // خريطة المواضع المميزة: صفحة -> rects
+    var highlightPositions by remember { mutableStateOf<Map<Int, List<RectF>>>(initialSearchPositions) }
+    // نص البحث الذي تُلوّن له الكلمات
+    var highlightQuery by remember { mutableStateOf(initialSearchQuery) }
+
+    var quoteText by remember { mutableStateOf("") }
+    var quoteImagePath by remember { mutableStateOf<String?>(null) }
+    var isUiVisible by rememberSaveable { mutableStateOf(true) }
+    var resetZoomTrigger by remember { mutableStateOf(0) }
+
+    // إذا وصلنا من بحث سابق، املأ النتائج
+    LaunchedEffect(Unit) {
+        if (initialSearchPositions.isNotEmpty()) {
+            searchResults = initialSearchPositions.keys.sorted()
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage) {
+        if (!isLandscape) onProgress(pagerState.currentPage)
+    }
+    LaunchedEffect(lazyListState.firstVisibleItemIndex) {
+        if (isLandscape) onProgress(lazyListState.firstVisibleItemIndex)
+    }
+
+    var isSyncingLayout by remember { mutableStateOf(false) }
+    LaunchedEffect(isLandscape) {
+        if (!isSyncingLayout) {
+            isSyncingLayout = true
+            try {
+                if (isLandscape) {
+                    lazyListState.scrollToItem(pagerState.currentPage)
+                } else {
+                    pagerState.scrollToPage(lazyListState.firstVisibleItemIndex)
+                }
+            } finally {
+                isSyncingLayout = false
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            AnimatedVisibility(visible = isUiVisible) {
+                Surface(shadowElevation = 4.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(50.dp).padding(horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = {
+                            onBack(if (isLandscape) lazyListState.firstVisibleItemIndex else pagerState.currentPage)
+                        }) { Icon(Icons.Default.ArrowBack, "رجوع") }
+                        Text(
+                            book.title,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(onClick = { showSearchDialog = true }) { Icon(Icons.Default.Search, "بحث") }
+                        IconButton(onClick = {
+                            scope.launch {
+                                val currentPage = if (isLandscape) lazyListState.firstVisibleItemIndex else pagerState.currentPage
+                                val bmp = withContext(Dispatchers.IO) { pdfSession.render(currentPage, 1080) }
+                                if (bmp != null) {
+                                    val file = File(context.filesDir, "quotes/${System.currentTimeMillis()}.png")
+                                    file.parentFile?.mkdirs()
+                                    file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                    quoteImagePath = file.absolutePath
+                                    quoteText = ""
+                                    showQuoteDialog = true
+                                }
+                            }
+                        }) { Icon(Icons.Default.FormatQuote, "اقتباس") }
+                        // زر مسح التمييز
+                        if (highlightPositions.isNotEmpty()) {
+                            IconButton(onClick = {
+                                highlightPositions = emptyMap()
+                                highlightQuery = ""
+                                searchResults = null
+                            }) { Icon(Icons.Default.Clear, "مسح التمييز") }
+                        }
+                    }
+                }
+            }
+        },
+        bottomBar = {
+            AnimatedVisibility(visible = isUiVisible) {
+                BottomAppBar(
+                    modifier = Modifier.height(56.dp),
+                    containerColor = Color(0xFF1E1E24),
+                    contentColor = Color(0xFF9E86FF)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = {
+                            activity.requestedOrientation =
+                                if (activity.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                else
+                                    ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        }) { Icon(Icons.Default.ScreenRotation, "تدوير") }
+
+                        IconButton(onClick = { showBrightnessDialog = true }) {
+                            Icon(Icons.Default.LightMode, "السطوع")
+                        }
+
+                        IconButton(onClick = {
+                            mode = when (mode) {
+                                ReadingMode.NORMAL -> ReadingMode.SEPIA
+                                ReadingMode.SEPIA -> ReadingMode.NIGHT
+                                ReadingMode.NIGHT -> ReadingMode.NORMAL
+                            }
+                        }) { Icon(Icons.Default.DarkMode, "تغيير الألوان") }
+
+                        IconButton(onClick = { showJumpDialog = true }) {
+                            Icon(Icons.Default.TouchApp, "انتقال")
+                        }
+
+                        IconButton(onClick = {
+                            resetZoomTrigger++
+                            isUiVisible = false
+                        }) { Icon(Icons.Default.KeyboardArrowDown, "توسيط") }
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+            if (isLandscape) {
+                LazyColumn(
+                    state = lazyListState,
+                    modifier = Modifier.fillMaxSize().background(mode.background)
+                ) {
+                    items(book.total) { pageIndex ->
+                        LandscapePdfPage(
+                            session = pdfSession,
+                            pageIndex = pageIndex,
+                            mode = mode,
+                            highlightPositions = highlightPositions[pageIndex],
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            onTap = { isUiVisible = !isUiVisible }
+                        )
+                    }
+                }
+            } else {
+                HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
+                    PortraitPdfPage(
+                        session = pdfSession,
+                        pageIndex = page,
+                        mode = mode,
+                        highlightPositions = highlightPositions[page],
+                        modifier = Modifier.fillMaxSize(),
+                        resetZoomTrigger = resetZoomTrigger,
+                        onTap = { isUiVisible = !isUiVisible }
+                    )
+                }
+            }
+
+            if (isUiVisible) {
+                val currentPage = if (isLandscape) lazyListState.firstVisibleItemIndex else pagerState.currentPage
+                Text(
+                    "${currentPage + 1} / ${book.total}",
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(16.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.small)
+                        .padding(8.dp),
+                    color = Color.White
+                )
+            }
+        }
+    }
+
+    if (showBrightnessDialog) {
+        AlertDialog(
+            onDismissRequest = { showBrightnessDialog = false },
+            title = { Text("سطوع الشاشة") },
+            text = {
+                Column {
+                    Slider(
+                        value = currentBrightness,
+                        onValueChange = {
+                            currentBrightness = it
+                            activity.window.attributes = activity.window.attributes.apply { screenBrightness = it }
+                        },
+                        valueRange = 0.1f..1.0f
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showBrightnessDialog = false }) { Text("موافق") }
+            }
+        )
+    }
+
+    if (showQuoteDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showQuoteDialog = false
+                quoteImagePath = null
+            },
+            title = { Text("حفظ اقتباس") },
+            text = {
+                OutlinedTextField(
+                    value = quoteText,
+                    onValueChange = { quoteText = it },
+                    label = { Text("نص (اختياري)") },
+                    minLines = 3
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val currentPage = if (isLandscape) lazyListState.firstVisibleItemIndex else pagerState.currentPage
+                    onAddQuote(
+                        Quote(
+                            UUID.randomUUID().toString(),
+                            book.title,
+                            quoteText.ifBlank { "صفحة ${currentPage + 1}" },
+                            quoteImagePath,
+                            currentPage,
+                            System.currentTimeMillis()
+                        )
+                    )
+                    showQuoteDialog = false
+                    quoteImagePath = null
+                    quoteText = ""
+                }) { Text("حفظ") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuoteDialog = false; quoteImagePath = null }) { Text("إلغاء") }
+            }
+        )
+    }
+
+    if (showJumpDialog) {
+        AlertDialog(
+            onDismissRequest = { showJumpDialog = false; jumpPageText = "" },
+            title = { Text("الانتقال إلى صفحة") },
+            text = {
+                OutlinedTextField(
+                    value = jumpPageText,
+                    onValueChange = { jumpPageText = it },
+                    label = { Text("رقم الصفحة (1 - ${book.total})") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val page = jumpPageText.toIntOrNull()?.minus(1)
+                    if (page != null && page in 0 until book.total) {
+                        scope.launch {
+                            if (isLandscape) lazyListState.scrollToItem(page) else pagerState.scrollToPage(page)
+                        }
+                    }
+                    showJumpDialog = false
+                    jumpPageText = ""
+                }) { Text("انتقال") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showJumpDialog = false; jumpPageText = "" }) { Text("إلغاء") }
+            }
+        )
+    }
+
+    if (showSearchDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                searchJob?.cancel()
+                isSearching = false
+                showSearchDialog = false
+            },
+            title = { Text("البحث في النص") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        label = { Text("أدخل الكلمة أو النص") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (isSearching) {
+                        LinearProgressIndicator(
+                            progress = { searchProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text("جاري البحث... ${(searchProgress * 100).toInt()}%", fontSize = 12.sp)
+                    } else if (searchResults != null) {
+                        if (searchResults!!.isEmpty()) {
+                            Text("لم يتم العثور على نتائج.", color = Color.Red)
+                        } else {
+                            Text(
+                                "تم العثور عليها في ${searchResults!!.size} صفحة (مميزة بالأصفر):",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            LazyColumn(modifier = Modifier.heightIn(max = 220.dp)) {
+                                items(searchResults!!) { page ->
+                                    Text(
+                                        text = "صفحة ${page + 1}",
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                scope.launch {
+                                                    if (isLandscape) lazyListState.scrollToItem(page)
+                                                    else pagerState.scrollToPage(page)
+                                                }
+                                                showSearchDialog = false
+                                            }
+                                            .padding(10.dp),
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (searchQuery.isNotBlank()) {
+                            isSearching = true
+                            searchResults = null
+                            searchProgress = 0f
+                            val q = searchQuery
+                            searchJob = scope.launch {
+                                val (pages, positions) = withContext(Dispatchers.IO) {
+                                    searchPdfWithPositions(book.path, q) { p ->
+                                        searchProgress = p
+                                    }
+                                }
+                                searchResults = pages
+                                highlightPositions = positions
+                                highlightQuery = q
+                                isSearching = false
+                            }
+                        }
+                    },
+                    enabled = searchQuery.isNotBlank() && !isSearching
+                ) { Text("بحث") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    searchJob?.cancel()
+                    isSearching = false
+                    showSearchDialog = false
+                }) { Text("إغلاق") }
+            }
+        )
+    }
+}
+
+// ===================== صفحات PDF =====================
+
+@Composable
+fun PortraitPdfPage(
+    session: PdfSession?,
+    pageIndex: Int,
+    mode: ReadingMode,
+    highlightPositions: List<RectF>?,
+    modifier: Modifier = Modifier,
+    resetZoomTrigger: Int,
+    onTap: () -> Unit
+) {
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    val density = LocalDensity.current
+    val config = LocalConfiguration.current
+    val targetWidth = with(density) { config.screenWidthDp.dp.toPx() }.toInt().coerceIn(720, 1400)
+
+    val bitmap by produceState<Bitmap?>(null, pageIndex, targetWidth, highlightPositions) {
+        value = withContext(Dispatchers.IO) {
+            val raw = session?.render(pageIndex, targetWidth)
+            if (raw != null && !highlightPositions.isNullOrEmpty()) {
+                drawHighlightsOnBitmap(raw, highlightPositions)
+            } else raw
+        }
+    }
+
+    LaunchedEffect(resetZoomTrigger, pageIndex) {
+        scale = 1f
+        offset = Offset.Zero
+    }
+
+    Box(
+        modifier = modifier
+            .background(mode.background)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    var isTap = true
+                    do {
+                        val event = awaitPointerEvent()
+                        val zoom = event.calculateZoom()
+                        val pan = event.calculatePan()
+
+                        if (zoom != 1f || pan != Offset.Zero) isTap = false
+
+                        if (scale > 1f || zoom > 1f) {
+                            event.changes.forEach { it.consume() }
+                            scale = (scale * zoom).coerceIn(1f, 5f)
+                            if (scale > 1f) offset += pan else offset = Offset.Zero
+                        }
+                    } while (event.changes.any { it.pressed })
+                    if (isTap) onTap()
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        val bmp = bitmap
+        if (bmp == null) CircularProgressIndicator()
+        else {
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offset.x,
+                        translationY = offset.y
+                    ),
+                contentScale = ContentScale.Fit,
+                colorFilter = mode.filter
+            )
+        }
+    }
+}
+
+@Composable
+fun LandscapePdfPage(
+    session: PdfSession?,
+    pageIndex: Int,
+    mode: ReadingMode,
+    highlightPositions: List<RectF>?,
+    modifier: Modifier = Modifier,
+    onTap: () -> Unit
+) {
+    val density = LocalDensity.current
+    val config = LocalConfiguration.current
+    val targetWidth = with(density) { config.screenWidthDp.dp.toPx() }.toInt().coerceIn(720, 1400)
+
+    val bitmap by produceState<Bitmap?>(null, pageIndex, targetWidth, highlightPositions) {
+        value = withContext(Dispatchers.IO) {
+            val raw = session?.render(pageIndex, targetWidth)
+            if (raw != null && !highlightPositions.isNullOrEmpty()) {
+                drawHighlightsOnBitmap(raw, highlightPositions)
+            } else raw
+        }
+    }
+    val bmp = bitmap
+    if (bmp != null) {
+        BoxWithConstraints(
+            modifier = modifier.pointerInput(Unit) { detectTapGestures(onTap = { onTap() }) }
+        ) {
+            val aspectRatio = bmp.width.toFloat() / bmp.height.toFloat()
+            val imageHeight = maxWidth / aspectRatio
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxWidth().height(imageHeight),
+                contentScale = ContentScale.FillWidth,
+                colorFilter = mode.filter
+            )
+        }
+    } else {
+        Box(modifier = Modifier.fillMaxWidth().height(400.dp), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+    }
+}
+
+// ===================== شاشة الاقتباسات =====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun QuotesScreen(quotes: List<Quote>, onDelete: (String) -> Unit, onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("مخزن الاقتباسات") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "رجوع") }
+                }
+            )
+        }
+    ) { padding ->
+        if (quotes.isEmpty()) {
+            Box(Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("لا توجد اقتباسات.")
+            }
+        } else {
+            LazyColumn(
+                Modifier.padding(padding).fillMaxSize(),
+                contentPadding = PaddingValues(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                items(quotes.sortedByDescending { it.createdAt }, key = { it.id }) { q ->
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp)) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(q.bookTitle, fontWeight = FontWeight.Bold)
+                                Row {
+                                    IconButton(onClick = { onDelete(q.id) }) {
+                                        Icon(Icons.Default.Delete, "حذف", tint = Color.Red)
+                                    }
+                                }
+                            }
+                            Text("صفحة ${q.page + 1}", fontSize = 12.sp)
+                            Spacer(Modifier.height(8.dp))
+                            if (q.text.isNotBlank()) Text(q.text)
+                            q.imagePath?.let { path ->
+                                val bmp by produceState<Bitmap?>(null, path) {
+                                    value = withContext(Dispatchers.IO) {
+                                        val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                                        BitmapFactory.decodeFile(path, opts)
+                                    }
+                                }
+                                if (bmp != null) {
+                                    Image(
+                                        bitmap = bmp!!.asImageBitmap(),
+                                        contentDescription = null,
+                                        modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ===================== أدوات الاستيراد =====================
+
+fun importPdf(context: Context, uri: Uri): Book? {
+    return try {
+        val displayName = queryDisplayName(context, uri) ?: "book.pdf"
+        val safeName = displayName.replace(Regex("[^\\p{L}\\p{N}._-]"), "_")
+        val file = File(context.filesDir, "books/${System.currentTimeMillis()}_$safeName")
+        file.parentFile?.mkdirs()
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            file.outputStream().use { output -> input.copyTo(output) }
+        } ?: return null
+        val total = getPageCount(file.absolutePath) ?: return null
+        val coverDir = File(context.filesDir, "covers")
+        coverDir.mkdirs()
+        val coverFile = File(coverDir, "${System.currentTimeMillis()}_cover.jpg")
+        val coverBmp = renderPdfPage(file.absolutePath, 0, 400)
+        coverBmp?.let { coverFile.outputStream().use { out -> it.compress(Bitmap.CompressFormat.JPEG, 80, out) } }
+
+        Book(
+            UUID.randomUUID().toString(),
+            file.absolutePath,
+            displayName.removeSuffix(".pdf"),
+            0,
+            total,
+            System.currentTimeMillis(),
+            coverFile.absolutePath,
+            0L
+        )
+    } catch (e: Exception) { null }
+}
+
+fun queryDisplayName(context: Context, uri: Uri): String? {
+    var name: String? = null
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0) name = cursor.getString(index)
+        }
+    }
+    return name
+}
+
+fun getPageCount(path: String): Int? {
+    var pfd: ParcelFileDescriptor? = null
+    var renderer: PdfRenderer? = null
+    return try {
+        pfd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+        renderer = PdfRenderer(pfd)
+        renderer.pageCount
+    } catch (e: Exception) {
+        null
+    } finally {
+        runCatching { renderer?.close() }
+        runCatching { pfd?.close() }
+    }
+}
